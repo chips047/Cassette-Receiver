@@ -1,0 +1,58 @@
+{
+    "glyphs": {
+        "1": {
+            "track": "1",
+            "start": 60,
+            "duration": 85,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "2": {
+            "track": "2",
+            "start": 140,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "3": {
+            "track": "1",
+            "start": 240,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "4": {
+            "track": "2",
+            "start": 240,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "5": {
+            "track": "3",
+            "start": 350,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "6": {
+            "track": "4",
+            "start": 350,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "7": {
+            "track": "5",
+            "start": 350,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "8": {
+            "track": "6",
+            "start": 350,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "10": {
+            "track": "3",
+            "start": 540,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        }
+    }
+}

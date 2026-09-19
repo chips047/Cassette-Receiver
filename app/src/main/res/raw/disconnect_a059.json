@@ -1,0 +1,10 @@
+{
+    "glyphs": {
+        "1": {
+            "track": "A",
+            "start": 0,
+            "duration": 2000,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        }
+    }
+}

@@ -1,0 +1,40 @@
+{
+    "glyphs": {
+        "1": {
+            "track": "1",
+            "start": 60,
+            "duration": 85,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "2": {
+            "track": "2",
+            "start": 140,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "3": {
+            "track": "1",
+            "start": 240,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "4": {
+            "track": "2",
+            "start": 240,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "5": {
+            "track": "A",
+            "start": 350,
+            "duration": 140,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "6": {
+            "track": "11",
+            "start": 540,
+            "duration": 90,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        }
+    }
+}

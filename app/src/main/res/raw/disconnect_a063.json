@@ -1,0 +1,28 @@
+{
+    "glyphs": {
+        "1": {
+            "track": "3",
+            "start": 0,
+            "duration": 2000,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "2": {
+            "track": "4",
+            "start": 0,
+            "duration": 2000,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "3": {
+            "track": "5",
+            "start": 0,
+            "duration": 2000,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        },
+        "4": {
+            "track": "6",
+            "start": 0,
+            "duration": 2000,
+            "keyframes": [[0.0, 100], [1.0, 0]]
+        }
+    }
+}
