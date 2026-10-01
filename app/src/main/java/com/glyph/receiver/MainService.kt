@@ -5,11 +5,20 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
+import android.content.Context
 import android.content.ComponentName
+import android.content.ContentValues
+import android.content.pm.ServiceInfo
 import android.media.MediaPlayer
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
+import android.os.Environment
+import android.os.PowerManager
+import android.provider.MediaStore
 import android.util.Log
+import android.util.Base64
 
 import com.nothing.ketchum.Glyph
 import com.nothing.ketchum.Common
@@ -17,6 +26,7 @@ import com.nothing.ketchum.GlyphFrame
 import com.nothing.ketchum.GlyphManager
 import com.nothing.ketchum.GlyphException
 
+import java.io.File
 import java.io.InputStream
 import java.io.PrintWriter
 import java.io.BufferedReader
@@ -24,10 +34,15 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.Socket
 import java.net.ServerSocket
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.SortedMap
+import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentSkipListMap
 
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -39,10 +54,13 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -51,19 +69,33 @@ import org.json.JSONObject
 
 class MainService : Service() {
 
+    enum class ConnectionStatus {
+        DISCONNECTED,
+        CONNECTED
+    }
+
     // Companion Section
     companion object {
+        const val server_port:                             Int    = 7777
+        const val discovery_port:                          Int    = 7778
+
         private const val log_tag:                         String = "GlyphReceiver"
         private const val notification_channel_identifier: String = "glyph_channel"
         private const val notification_identifier:         Int    = 1
-        private const val server_port:                     Int    = 7777
         private const val frame_period_ms:                 Int    = 10
         private const val maximum_brightness:              Double = 4095.0
         private const val animation_step_ms:               Long   = 16L
         private const val initial_capacity:                Int    = 50000
         private const val batch_size:                      Int    = 1000
+        private const val socket_timeout_ms:               Int    = 10000
         private const val device_identifier_4a:            String = "25111"
         private const val device_identifier_4b:            String = "25131"
+
+        private val mutable_connection_state = MutableStateFlow(ConnectionStatus.DISCONNECTED)
+        val connection_state: StateFlow<ConnectionStatus> = mutable_connection_state.asStateFlow()
+
+        private val mutable_client_endpoint = MutableStateFlow<String?>(null)
+        val client_endpoint: StateFlow<String?> = mutable_client_endpoint.asStateFlow()
 
         private fun build_device_track_map(tracks: Map<String, IntArray>): Map<String, IntArray> {
             val result_map: MutableMap<String, IntArray> = tracks.toMutableMap()
@@ -96,8 +128,17 @@ class MainService : Service() {
     }
 
     // Properties Section
+    private var active_client_socket:            Socket?                                = null
+    private var is_glyph_initialized:            Boolean                                = false
+    private var is_session_opened:                Boolean                                = false
+
     private var server_socket:                   ServerSocket?                          = null
+    private var udp_socket:                      DatagramSocket?                        = null
     private var glyph_manager:                   GlyphManager?                          = null
+    private var wake_lock:                       PowerManager.WakeLock?                 = null
+    private var wifi_lock:                       WifiManager.WifiLock?                  = null
+    private var low_latency_wifi_lock:           WifiManager.WifiLock?                  = null
+    private var multicast_lock:                  WifiManager.MulticastLock?             = null
     private var connection_sound:                MediaPlayer?                           = null
     private var disconnection_sound:             MediaPlayer?                           = null
     private var animation_job:                   Job?                                   = null
@@ -107,16 +148,24 @@ class MainService : Service() {
 
     private var timeline_built:                  Boolean                                = false
     private var socket_server_started:           Boolean                                = false
+    private var udp_server_started:              Boolean                                = false
     private var maximum_timeline_ms:             Long                                   = 0L
     private var connect_animation_maximum_ms:    Long                                   = 0L
     private var disconnect_animation_maximum_ms: Long                                   = 0L
     private var playback_speed:                  Double                                 = 1.0
     private var current_timeline_position:       Double                                 = 0.0
 
-    private val data_lock:                       Mutex                                  = Mutex()
+    private val timeline_mutex:                  Mutex                                  = Mutex()
+    private val playback_executor                                                       = Executors.newSingleThreadExecutor { runnable: Runnable ->
+        Thread(runnable, "GlyphPlaybackThread").apply {
+            priority = Thread.MAX_PRIORITY
+        }
+    }
+    private val playback_dispatcher                                                     = playback_executor.asCoroutineDispatcher()
     private val service_scope:                   CoroutineScope                         = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     private val glyph_map:                       ConcurrentHashMap<String, JSONObject> = ConcurrentHashMap<String, JSONObject>(initial_capacity)
-    private val precomputed_events:              ConcurrentHashMap<Long, IntArray>      = ConcurrentHashMap<Long, IntArray>(10000)
+    private val precomputed_events:              ConcurrentSkipListMap<Long, IntArray>  = ConcurrentSkipListMap<Long, IntArray>()
     private val connect_animation_events:        SortedMap<Long, IntArray>              = sortedMapOf<Long, IntArray>()
     private val disconnect_animation_events:     SortedMap<Long, IntArray>              = sortedMapOf<Long, IntArray>()
 
@@ -169,7 +218,7 @@ class MainService : Service() {
     private val track_map_phone_4a: Map<String, IntArray> = build_segmented_bar_track_map(7)
     private val track_map_phone_4b: Map<String, IntArray> = build_segmented_bar_track_map(5)
 
-    val track_map_by_model: Map<String, Map<String, IntArray>> = mapOf(
+    private val track_map_by_model: Map<String, Map<String, IntArray>> = mapOf(
         "20111"  to track_map_phone_1,
         "A063"   to track_map_phone_1,
 
@@ -193,10 +242,13 @@ class MainService : Service() {
         "A009P"  to track_map_phone_4b
     )
 
-    // Service Lifecycle Section
+    // Lifecycle Section
     override fun onCreate(): Unit {
         super.onCreate()
-        Log.i(log_tag, "Service created")
+
+        elevate_process_priority()
+        acquire_screen_lock()
+        acquire_hardware_wifi_lock()
         create_notification_channel()
         ensure_device_registered_immediately()
     }
@@ -206,7 +258,7 @@ class MainService : Service() {
         flags:            Int,
         start_identifier: Int
     ): Int {
-        Log.i(log_tag, "Service started")
+        elevate_process_priority()
         start_foreground_notification()
         ensure_device_registered_immediately()
         initialize_glyph_manager()
@@ -217,9 +269,67 @@ class MainService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy(): Unit {
-        Log.i(log_tag, "Service destroyed")
         cleanup()
         super.onDestroy()
+    }
+
+    // Process Priority Section
+    private fun elevate_process_priority(): Unit {
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        }
+
+        catch (exception: Exception) {
+            Log.w(log_tag, "Could not set urgent audio thread priority: ${exception.message}")
+        }
+    }
+
+    // Power & Hardware Wi-Fi Lock Section
+    private fun acquire_screen_lock(): Unit {
+        if (wake_lock != null) {
+            return
+        }
+
+        val power_manager: PowerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
+        wake_lock = power_manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Cassette::WakeLock").apply {
+            setReferenceCounted(false)
+            acquire(86400000L)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquire_hardware_wifi_lock(): Unit {
+        try {
+            val wifi_manager: WifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                low_latency_wifi_lock = wifi_manager.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                    "Cassette::LowLatencyWifi"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
+
+            wifi_lock = wifi_manager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "Cassette::HighPerfWifi"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+
+            multicast_lock = wifi_manager.createMulticastLock("Cassette::MulticastLock").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+
+        catch (exception: Exception) {
+            Log.w(log_tag, "Could not acquire Wi-Fi Hardware Locks: ${exception.message}")
+        }
     }
 
     // Notification Section
@@ -228,24 +338,37 @@ class MainService : Service() {
             notification_channel_identifier,
             "Glyph Receiver",
             NotificationManager.IMPORTANCE_LOW
-        )
+        ).apply {
+            description = "Maintains connection with Cassette desktop app"
+            setShowBadge(false)
+        }
 
         val manager: NotificationManager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
-        Log.i(log_tag, "Notification channel created")
     }
 
     private fun start_foreground_notification(): Unit {
         val notification: Notification = Notification.Builder(this, notification_channel_identifier)
-            .setContentTitle("Glyph Receiver Running")
+            .setContentTitle("Cassette Receiver")
+            .setContentText("Background service active. Ready to connect.")
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
             .build()
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                notification_identifier,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+
+            return
+        }
+
         startForeground(notification_identifier, notification)
-        Log.i(log_tag, "Foreground notification started")
     }
 
-    // Feedback Media Section
+    // Audio & Preloaded Animation Section
     private fun play_connection_success_sound(): Unit {
         try {
             val media_player: MediaPlayer = connection_sound ?: return
@@ -267,16 +390,16 @@ class MainService : Service() {
         }
 
         catch (exception: Exception) {
-            Log.w(log_tag, "Failed to play connection sound: ${exception.message}")
+            Log.w(log_tag, "Connection sound error: ${exception.message}")
         }
     }
 
-    private suspend fun play_goodbye_sound(): Unit = withContext(Dispatchers.Main) {
+    private suspend fun play_goodbye_sound(): Unit {
         try {
-            val media_player: MediaPlayer = disconnection_sound ?: return@withContext
+            val media_player: MediaPlayer = disconnection_sound ?: return
 
             if (media_player.isPlaying) {
-                return@withContext
+                return
             }
 
             val completion: CompletableDeferred<Unit> = CompletableDeferred<Unit>()
@@ -298,22 +421,24 @@ class MainService : Service() {
         }
 
         catch (exception: Exception) {
-            Log.w(log_tag, "Failed to play goodbye sound and animation: ${exception.message}")
+            Log.w(log_tag, "Disconnect sound error: ${exception.message}")
         }
     }
 
     private fun play_isolated_animation(
-        events: SortedMap<Long, IntArray>,
-        max_ms: Long
+        events:     SortedMap<Long, IntArray>,
+        maximum_ms: Long
     ): Unit {
         connect_animation_job?.cancel()
 
-        connect_animation_job = service_scope.launch {
+        connect_animation_job = service_scope.launch(playback_dispatcher) {
+            elevate_process_priority()
+
             val state: MutableMap<Int, Int> = mutableMapOf<Int, Int>()
             var position: Double            = 0.0
             var last_real_time: Long        = System.currentTimeMillis()
 
-            while (isActive && position <= max_ms) {
+            while (isActive && position <= maximum_ms) {
                 val current_time: Long = System.currentTimeMillis()
                 val delta_time: Long   = current_time - last_real_time
 
@@ -339,9 +464,7 @@ class MainService : Service() {
                 if (has_changed) {
                     val frame_channels: Map<Int, Int> = state.filterValues { value: Int -> value > 0 }
 
-                    withContext(Dispatchers.Main) {
-                        update_glyph_frame(frame_channels)
-                    }
+                    update_glyph_frame(frame_channels)
                 }
 
                 delay(animation_step_ms)
@@ -349,7 +472,6 @@ class MainService : Service() {
         }
     }
 
-    // Animation Preload Section
     private fun preload_animations(): Unit {
         val device_identifier: String = current_device_identifier ?: return
 
@@ -454,7 +576,6 @@ class MainService : Service() {
             }
 
             catch (exception: Exception) {
-                Log.w(log_tag, "Failed to parse $candidate: ${exception.message}")
                 null
             }
         }
@@ -462,37 +583,7 @@ class MainService : Service() {
         return null
     }
 
-    // Device Session Section
-    private fun check_device_match(
-        check_function:   () -> Boolean,
-        model_substring:  String,
-        device_substring: String
-    ): Boolean {
-        return try {
-            check_function()
-        }
-
-        catch (throwable: Throwable) {
-            Build.MODEL.contains(model_substring, ignoreCase = true) || Build.DEVICE.contains(device_substring)
-        }
-    }
-
-    private fun is_device_25111(): Boolean {
-        return check_device_match(
-            { Common.is25111() },
-            "A069",
-            "25111"
-        )
-    }
-
-    private fun is_device_25131(): Boolean {
-        return check_device_match(
-            { Common.is25131() },
-            "A009P",
-            "25131"
-        )
-    }
-
+    // Device Detection Section
     private fun detect_device_identifier(): String? {
         val model: String  = Build.MODEL.uppercase()
         val device: String = Build.DEVICE.uppercase()
@@ -517,24 +608,12 @@ class MainService : Service() {
             return Glyph.DEVICE_24111
         }
 
-        if (is_device_25111() || model.contains("A069") || device.contains("25111")) {
-            return try {
-                Glyph.DEVICE_25111
-            }
-
-            catch (throwable: Throwable) {
-                device_identifier_4a
-            }
+        if (model.contains("A069") || device.contains("25111")) {
+            return device_identifier_4a
         }
 
-        if (is_device_25131() || model.contains("A009P") || device.contains("25131")) {
-            return try {
-                Glyph.DEVICE_25131
-            }
-
-            catch (throwable: Throwable) {
-                device_identifier_4b
-            }
+        if (model.contains("A009P") || device.contains("25131")) {
+            return device_identifier_4b
         }
 
         return null
@@ -548,149 +627,292 @@ class MainService : Service() {
         val detected_identifier: String = detect_device_identifier() ?: return
         current_device_identifier       = detected_identifier
         current_track_map               = track_map_by_model[detected_identifier]
-
-        Log.i(log_tag, "Device track map resolved synchronously: $detected_identifier")
     }
 
     private fun initialize_glyph_manager(): Unit {
         ensure_device_registered_immediately()
 
-        service_scope.launch {
-            Log.i(log_tag, "Initializing GlyphManager")
+        if (!is_glyph_initialized || glyph_manager == null) {
             glyph_manager = GlyphManager.getInstance(applicationContext)
 
             glyph_manager?.init(object : GlyphManager.Callback {
                 override fun onServiceConnected(name: ComponentName?): Unit {
+                    is_glyph_initialized = true
                     register_device_and_open_session()
                 }
 
                 override fun onServiceDisconnected(name: ComponentName?): Unit {
-                    Log.w(log_tag, "onServiceDisconnected: $name")
+                    is_glyph_initialized = false
+                    is_session_opened     = false
+
                     glyph_manager?.closeSession()
+
+                    service_scope.launch {
+                        delay(1000L)
+
+                        if (!is_glyph_initialized) {
+                            initialize_glyph_manager()
+                        }
+                    }
                 }
             })
+        }
 
-            start_socket_server()
+        else if (!is_session_opened) {
+            register_device_and_open_session()
+        }
+
+        if (!socket_server_started) {
+            service_scope.launch(Dispatchers.IO) {
+                start_socket_server()
+            }
+        }
+
+        if (!udp_server_started) {
+            service_scope.launch(Dispatchers.IO) {
+                start_udp_discovery_responder()
+            }
         }
     }
 
     private fun register_device_and_open_session(): Unit {
-        val detected_identifier: String = detect_device_identifier() ?: run {
-            Log.w(log_tag, "Unknown device variant")
-            return
-        }
+        val detected_identifier: String = detect_device_identifier() ?: return
 
         current_device_identifier = detected_identifier
         current_track_map         = track_map_by_model[detected_identifier]
 
-        glyph_manager?.register(detected_identifier)
-        Log.i(log_tag, "Registered $detected_identifier")
-
         try {
+            glyph_manager?.register(detected_identifier)
             glyph_manager?.openSession()
-            Log.i(log_tag, "Glyph session opened")
+
+            is_session_opened = true
 
             preload_animations()
-            play_connection_success_sound()
         }
 
         catch (exception: GlyphException) {
             Log.e(log_tag, "Failed to open session: ${exception.message}")
+
+            is_session_opened = false
+
+            service_scope.launch {
+                delay(800L)
+
+                if (!is_session_opened) {
+                    try {
+                        glyph_manager?.openSession()
+
+                        is_session_opened = true
+
+                        preload_animations()
+                    }
+
+                    catch (retry_exception: Exception) {
+                        Log.e(log_tag, "Retry open session failed: ${retry_exception.message}")
+                    }
+                }
+            }
         }
     }
 
-    // Socket Server Section
+    // UDP Discovery Section
+    private fun start_udp_discovery_responder(): Unit {
+        if (udp_server_started && udp_socket != null && !udp_socket!!.isClosed) {
+            return
+        }
+
+        elevate_process_priority()
+
+        try {
+            udp_socket = DatagramSocket(discovery_port, InetAddress.getByName("0.0.0.0")).apply {
+                broadcast    = true
+                reuseAddress = true
+            }
+
+            udp_server_started = true
+
+            val buffer: ByteArray = ByteArray(1024)
+
+            while (service_scope.isActive) {
+                val packet: DatagramPacket = DatagramPacket(buffer, buffer.size)
+
+                udp_socket?.receive(packet)
+
+                val request: String = String(packet.data, 0, packet.length).trim()
+
+                if (!request.contains("CASSETTE_DISCOVERY_PROBE")) {
+                    continue
+                }
+
+                val reply_json: JSONObject = JSONObject().apply {
+                    put("service", "cassette_receiver")
+                    put("status", "ready")
+                    put("tcp_port", server_port)
+                    put("device", current_device_identifier ?: "unknown")
+                }
+
+                val reply_bytes: ByteArray = (reply_json.toString() + "\n").toByteArray()
+
+                val response_packet: DatagramPacket = DatagramPacket(
+                    reply_bytes,
+                    reply_bytes.size,
+                    packet.address,
+                    packet.port
+                )
+
+                udp_socket?.send(response_packet)
+            }
+        }
+
+        catch (exception: Exception) {
+            if (service_scope.isActive) {
+                Log.w(log_tag, "UDP discovery error: ${exception.message}")
+            }
+        }
+
+        finally {
+            udp_server_started = false
+        }
+    }
+
+    // TCP Socket Server Section
     private suspend fun start_socket_server(): Unit {
         if (socket_server_started && server_socket != null && !server_socket!!.isClosed) {
-            Log.i(log_tag, "Socket server is already running on port $server_port")
             return
         }
 
         try {
-            val server: ServerSocket = ServerSocket()
-            server.reuseAddress      = true
+            val server: ServerSocket = ServerSocket().apply {
+                reuseAddress = true
 
-            server.bind(InetSocketAddress(server_port))
+                setPerformancePreferences(0, 2, 1)
+                bind(InetSocketAddress(server_port))
+            }
 
             server_socket         = server
             socket_server_started = true
-            Log.i(log_tag, "Listening on localhost:$server_port")
 
             while (true) {
-                val socket: Socket = server.accept()
-                Log.i(log_tag, "Accepted connection from ${socket.inetAddress}")
+                val client_socket: Socket = server.accept()
 
-                service_scope.launch {
-                    handle_client(socket)
+                active_client_socket?.let { previous_socket: Socket ->
+                    close_socket(previous_socket)
+                }
+
+                active_client_socket = client_socket
+
+                client_socket.setPerformancePreferences(0, 2, 1)
+                client_socket.tcpNoDelay        = true
+                client_socket.trafficClass      = 0x10
+                client_socket.keepAlive         = true
+                client_socket.soTimeout         = socket_timeout_ms
+                client_socket.sendBufferSize    = 65536
+                client_socket.receiveBufferSize = 65536
+
+                val remote_ip: String = client_socket.inetAddress.hostAddress ?: "unknown"
+
+                mutable_client_endpoint.value  = remote_ip
+                mutable_connection_state.value = ConnectionStatus.CONNECTED
+
+                play_connection_success_sound()
+
+                service_scope.launch(Dispatchers.IO) {
+                    elevate_process_priority()
+                    handle_client(client_socket)
                 }
             }
         }
 
         catch (exception: Exception) {
-            Log.e(log_tag, "Socket server error: ${exception.message}", exception)
+            Log.e(log_tag, "Socket server error: ${exception.message}")
         }
     }
 
-    private suspend fun handle_client(socket: Socket): Unit {
+    private suspend fun handle_client(client_socket: Socket): Unit {
+        var heartbeat_job: Job? = null
+
         try {
-            val reader: BufferedReader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            val writer: PrintWriter    = PrintWriter(OutputStreamWriter(socket.getOutputStream()), true)
+            val reader: BufferedReader = BufferedReader(InputStreamReader(client_socket.getInputStream()))
+            val writer: PrintWriter    = PrintWriter(OutputStreamWriter(client_socket.getOutputStream()), true)
+
+            heartbeat_job = service_scope.launch(Dispatchers.IO) {
+                elevate_process_priority()
+
+                while (isActive) {
+                    delay(1000L)
+
+                    writer.println("{}")
+
+                    if (writer.checkError()) {
+                        close_socket(client_socket)
+
+                        break
+                    }
+                }
+            }
 
             while (true) {
                 val line: String? = reader.readLine()
 
-                if (line.isNullOrBlank()) {
-                    Log.d(log_tag, "Received null or blank line, closing connection")
+                if (line == null) {
                     break
                 }
 
-                Log.i(log_tag, "Received line: $line")
+                if (line.isBlank()) {
+                    continue
+                }
+
                 process_command(line, writer)
             }
         }
 
         catch (exception: Exception) {
-            Log.e(log_tag, "Client socket error: ${exception.message}", exception)
+            Log.w(log_tag, "Client connection exception: ${exception.message}")
         }
 
         finally {
-            close_socket(socket)
+            heartbeat_job?.cancel()
+            heartbeat_job = null
+
+            close_socket(client_socket)
+
+            if (active_client_socket == client_socket) {
+                active_client_socket = null
+
+                mutable_connection_state.value = ConnectionStatus.DISCONNECTED
+                mutable_client_endpoint.value  = null
+
+                stop_all()
+            }
         }
     }
 
-    private fun close_socket(socket: Socket): Unit {
+    private fun close_socket(target_socket: Socket): Unit {
         try {
-            socket.close()
-            Log.i(log_tag, "Socket closed")
+            target_socket.close()
         }
 
         catch (exception: Exception) {
-            Log.w(log_tag, "Error closing socket: ${exception.message}")
+            Log.w(log_tag, "Error closing client socket: ${exception.message}")
         }
     }
 
-    // Command Processing Section
-    private fun process_command(
-        line:   String,
-        writer: PrintWriter
+    // Command Dispatcher Section
+    private suspend fun process_command(
+        command_line: String,
+        writer:       PrintWriter
     ): Unit {
         try {
-            val json_command: JSONObject = JSONObject(line)
+            val json_command: JSONObject = JSONObject(command_line)
             val action: String            = json_command.optString("action")
-
-            Log.i(log_tag, "Parsed action: $action")
 
             when (action) {
                 "load" -> {
-                    service_scope.launch {
-                        handle_load_action(json_command)
-                    }
+                    handle_load_action(json_command)
                 }
 
                 "update" -> {
-                    service_scope.launch {
-                        handle_update_action(json_command)
-                    }
+                    handle_update_action(json_command)
                 }
 
                 "delete" -> {
@@ -706,7 +928,7 @@ class MainService : Service() {
                 }
 
                 "ping" -> {
-                    handle_ping_action(writer)
+                    handle_ping_action(json_command, writer)
                 }
 
                 "stop_app" -> {
@@ -721,31 +943,91 @@ class MainService : Service() {
                     handle_set_speed_action(json_command)
                 }
 
-                else -> {
-                    Log.w(log_tag, "Unknown action: $action")
+                "save_ringtone" -> {
+                    handle_save_ringtone_action(json_command)
                 }
             }
         }
 
         catch (exception: Exception) {
-            Log.e(log_tag, "Error parsing command: ${exception.message}", exception)
+            Log.e(log_tag, "Command error: ${exception.message}")
         }
     }
 
     private fun handle_set_speed_action(json_command: JSONObject): Unit {
         val speed: Double = json_command.optDouble("value", 1.0)
 
-        if (speed < 0.0) {
+        if (speed >= 0.0) {
+            playback_speed = speed
+        }
+    }
+
+    private fun handle_ping_action(
+        json_command: JSONObject,
+        writer:       PrintWriter
+    ): Unit {
+        val timestamp: Double      = json_command.optDouble("timestamp", 0.0)
+        val reply_json: JSONObject = JSONObject().apply {
+            put("action", "pong")
+            put("timestamp", timestamp)
+        }
+
+        writer.println(reply_json.toString())
+        writer.flush()
+    }
+
+    private fun handle_save_ringtone_action(json_command: JSONObject): Unit {
+        val file_name: String       = json_command.optString("name", "ringtone.ogg")
+        val encoded_content: String = json_command.optString("content", "")
+
+        if (encoded_content.isEmpty()) {
             return
         }
 
-        playback_speed = speed
-        Log.d(log_tag, "Speed updated to $speed")
-    }
+        service_scope.launch(Dispatchers.IO) {
+            try {
+                val audio_bytes: ByteArray = Base64.decode(encoded_content, Base64.DEFAULT)
 
-    private fun handle_ping_action(writer: PrintWriter): Unit {
-        writer.println("pong")
-        Log.i(log_tag, "Sent ping response")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val relative_directory_path: String = "${Environment.DIRECTORY_RINGTONES}/Compositions/"
+
+                    val content_values: ContentValues = ContentValues().apply {
+                        put(MediaStore.Audio.Media.DISPLAY_NAME, file_name)
+                        put(MediaStore.Audio.Media.MIME_TYPE, "audio/ogg")
+                        put(MediaStore.Audio.Media.RELATIVE_PATH, relative_directory_path)
+                        put(MediaStore.Audio.Media.IS_RINGTONE, 1)
+                    }
+
+                    val content_resolver = applicationContext.contentResolver
+                    val audio_uri        = content_resolver.insert(
+                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        content_values
+                    )
+
+                    if (audio_uri != null) {
+                        content_resolver.openOutputStream(audio_uri)?.use { output_stream ->
+                            output_stream.write(audio_bytes)
+                        }
+                    }
+                }
+
+                else {
+                    val base_directory      = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_RINGTONES)
+                    val compositions_folder = File(base_directory, "Compositions")
+
+                    if (!compositions_folder.exists()) {
+                        compositions_folder.mkdirs()
+                    }
+
+                    val destination_file = File(compositions_folder, file_name)
+                    destination_file.writeBytes(audio_bytes)
+                }
+            }
+
+            catch (exception: Exception) {
+                Log.e(log_tag, "Failed to save ringtone: ${exception.message}")
+            }
+        }
     }
 
     private fun handle_stop_app(): Unit {
@@ -757,117 +1039,99 @@ class MainService : Service() {
     }
 
     private fun handle_stop_action(): Unit {
-        Log.i(log_tag, "Stop command received")
         stop_all()
     }
 
     private fun handle_play_action(json_object: JSONObject): Unit {
         val from_ms: Long = json_object.optLong("from_ms", 0L)
-        Log.i(log_tag, "Playing from $from_ms ms")
+
         play_from_timeline(from_ms)
     }
 
-    private fun handle_delete_action(json_object: JSONObject): Unit {
+    private suspend fun handle_delete_action(json_object: JSONObject): Unit {
         val identifiers_to_delete: JSONArray = json_object.getJSONArray("ids")
 
-        for (index in 0 until identifiers_to_delete.length()) {
-            val identifier: String = identifiers_to_delete.getString(index)
+        timeline_mutex.withLock {
+            for (index in 0 until identifiers_to_delete.length()) {
+                val identifier: String = identifiers_to_delete.getString(index)
 
-            glyph_map.remove(identifier)
-            remove_effect_glyphs(identifier)
-        }
+                glyph_map.remove(identifier)
+                remove_effect_glyphs(identifier)
+            }
 
-        service_scope.launch {
             build_timeline_internal()
         }
-
-        Log.i(log_tag, "Glyphs deleted: ${identifiers_to_delete.length()}")
     }
 
-    private suspend fun handle_load_action(json_object: JSONObject): Unit = withContext(Dispatchers.Default) {
-        val start_time_ms:    Long      = System.currentTimeMillis()
-        Log.i(log_tag, "Starting optimized load...")
+    private suspend fun handle_load_action(json_object: JSONObject): Unit {
+        timeline_mutex.withLock {
+            glyph_map.clear()
+            precomputed_events.clear()
 
-        glyph_map.clear()
-        precomputed_events.clear()
-        timeline_built = false
+            timeline_built = false
 
-        val glyphs:           JSONArray = json_object.getJSONArray("glyphs")
-        val total_glyphs:     Int       = glyphs.length()
-        var processed_glyphs: Int       = 0
-        var unpacked_count:   Int       = 0
+            val glyphs: JSONArray = json_object.getJSONArray("glyphs")
+            val total_glyphs: Int = glyphs.length()
 
-        for (batch_start in 0 until total_glyphs step batch_size) {
-            val batch_end: Int = minOf(batch_start + batch_size, total_glyphs)
+            for (batch_start in 0 until total_glyphs step batch_size) {
+                val batch_end: Int = minOf(batch_start + batch_size, total_glyphs)
 
-            for (index in batch_start until batch_end) {
-                val glyph: JSONObject  = glyphs.getJSONObject(index)
-                val identifier: String = glyph.optString("id", UUID.randomUUID().toString())
+                for (index in batch_start until batch_end) {
+                    val glyph: JSONObject  = glyphs.getJSONObject(index)
+                    val identifier: String = glyph.optString("id", UUID.randomUUID().toString())
+
+                    if (glyph.has("effect") && glyph.has("effect_to_glyphs")) {
+                        unpack_effect_glyphs(identifier, glyph)
+                    }
+
+                    else {
+                        glyph.put("id", identifier)
+                        glyph_map[identifier] = glyph
+                    }
+                }
+
+                if (batch_start % (batch_size * 5) == 0) {
+                    yield()
+                }
+            }
+
+            build_timeline_internal()
+        }
+    }
+
+    private suspend fun handle_update_action(json_object: JSONObject): Unit {
+        timeline_mutex.withLock {
+            val glyphs: JSONObject     = json_object.getJSONObject("glyphs")
+            val keys: Iterator<String> = glyphs.keys()
+
+            while (keys.hasNext()) {
+                val identifier: String = keys.next()
+                val glyph: JSONObject  = glyphs.getJSONObject(identifier)
+
+                remove_effect_glyphs(identifier)
+                glyph_map.remove(identifier)
 
                 if (glyph.has("effect") && glyph.has("effect_to_glyphs")) {
-                    unpacked_count += unpack_effect_glyphs(identifier, glyph)
+                    unpack_effect_glyphs(identifier, glyph)
                 }
 
                 else {
                     glyph.put("id", identifier)
                     glyph_map[identifier] = glyph
                 }
-
-                processed_glyphs++
             }
 
-            if (batch_start % (batch_size * 5) == 0) {
-                yield()
-                Log.d(log_tag, "Processed $processed_glyphs/$total_glyphs glyphs")
-            }
+            build_timeline_internal()
         }
-
-        build_timeline_internal()
-
-        val load_time_ms: Long = System.currentTimeMillis() - start_time_ms
-        Log.i(log_tag, "Optimized load completed in ${load_time_ms}ms. Total: ${glyph_map.size}, Unpacked: $unpacked_count, Events: ${precomputed_events.size}")
-    }
-
-    private suspend fun handle_update_action(json_object: JSONObject): Unit = withContext(Dispatchers.Default) {
-        val glyphs: JSONObject         = json_object.getJSONObject("glyphs")
-        val keys: Iterator<String>     = glyphs.keys()
-        var updated_count: Int         = 0
-        var unpacked_count: Int        = 0
-
-        while (keys.hasNext()) {
-            val identifier: String     = keys.next()
-            val glyph: JSONObject      = glyphs.getJSONObject(identifier)
-
-            remove_effect_glyphs(identifier)
-            glyph_map.remove(identifier)
-
-            if (glyph.has("effect") && glyph.has("effect_to_glyphs")) {
-                unpacked_count += unpack_effect_glyphs(identifier, glyph)
-            }
-
-            else {
-                glyph.put("id", identifier)
-                glyph_map[identifier] = glyph
-                updated_count++
-            }
-        }
-
-        build_timeline_internal()
-        Log.i(log_tag, "Update completed. Updated: $updated_count, Unpacked: $unpacked_count")
     }
 
     private fun handle_pulse_action(json_object: JSONObject): Unit {
-        val track_name: String = json_object.optString("track", null) ?: run {
-            Log.w(log_tag, "pulse: missing track")
-            return
-        }
+        val track_name: String = json_object.optString("track", null) ?: return
+        val channels: IntArray = resolve_track_channels(track_name) ?: return
 
-        val channels: IntArray = resolve_track_channels(track_name) ?: run {
-            Log.w(log_tag, "pulse: unknown track '$track_name'")
-            return
-        }
+        service_scope.launch(playback_dispatcher) {
+            elevate_process_priority()
 
-        service_scope.launch {
             val duration_ms: Long = 200L
             val steps: Int        = (duration_ms / animation_step_ms).toInt()
 
@@ -876,20 +1140,16 @@ class MainService : Service() {
                 val eased: Double      = 1.0 - (1.0 - progress).pow(2)
                 val brightness: Int    = convert_brightness(100.0 * (1.0 - eased))
 
-                withContext(Dispatchers.Main) {
-                    update_glyph_frame(channels.associate { channel: Int -> channel to brightness })
-                }
+                update_glyph_frame(channels.associateWith { brightness })
 
                 delay(animation_step_ms)
             }
 
-            withContext(Dispatchers.Main) {
-                update_glyph_frame(channels.associate { channel: Int -> channel to 0 })
-            }
+            update_glyph_frame(channels.associateWith { 0 })
         }
     }
 
-    // Timeline Engine Section
+    // Timeline Processing Section
     private fun unpack_effect_glyphs(
         identifier: String,
         glyph:      JSONObject
@@ -912,23 +1172,17 @@ class MainService : Service() {
     }
 
     private fun remove_effect_glyphs(identifier: String): Int {
-        val prefix: String                      = "$identifier@"
-        val keys_to_remove: MutableList<String> = mutableListOf<String>()
+        val prefix: String               = "$identifier@"
+        val keys_to_remove: List<String> = glyph_map.keys.filter { key: String -> key.startsWith(prefix) }
 
-        for (key in glyph_map.keys) {
-            if (key.startsWith(prefix)) {
-                keys_to_remove.add(key)
-            }
-        }
-
-        for (key in keys_to_remove) {
+        keys_to_remove.forEach { key: String ->
             glyph_map.remove(key)
         }
 
         return keys_to_remove.size
     }
 
-    private suspend fun build_timeline_internal(): Unit {
+    private fun build_timeline_internal(): Unit {
         precomputed_events.clear()
 
         val event_changes: SortedMap<Long, MutableList<Pair<IntArray, Int>>> = sortedMapOf<Long, MutableList<Pair<IntArray, Int>>>()
@@ -940,7 +1194,7 @@ class MainService : Service() {
 
         compile_events_into(event_changes, precomputed_events)
 
-        maximum_timeline_ms = precomputed_events.keys.maxOrNull() ?: 0L
+        maximum_timeline_ms = precomputed_events.keys.lastOrNull() ?: 0L
         timeline_built      = true
     }
 
@@ -948,9 +1202,9 @@ class MainService : Service() {
         glyph:         JSONObject,
         event_changes: MutableMap<Long, MutableList<Pair<IntArray, Int>>>
     ): Unit {
-        val glyph_start: Long      = glyph.getDouble("start").toLong()
-        val glyph_duration: Long   = glyph.getLong("duration")
-        val track_name: String     = glyph.getString("track")
+        val glyph_start: Long    = glyph.getDouble("start").toLong()
+        val glyph_duration: Long = glyph.getLong("duration")
+        val track_name: String   = glyph.getString("track")
 
         val channel_list: IntArray = get_channel_list(glyph, track_name) ?: return
 
@@ -966,11 +1220,13 @@ class MainService : Service() {
             return
         }
 
-        val start_brightness: Int = convert_brightness(glyph.getDouble("brightness"))
-        val end_time: Long        = glyph_start + glyph_duration
+        if (glyph.has("brightness")) {
+            val start_brightness: Int = convert_brightness(glyph.getDouble("brightness"))
+            val end_time: Long        = glyph_start + glyph_duration
 
-        event_changes.getOrPut(glyph_start) { mutableListOf() }.add(channel_list to start_brightness)
-        event_changes.getOrPut(end_time) { mutableListOf() }.add(channel_list to -start_brightness)
+            event_changes.getOrPut(glyph_start) { mutableListOf() }.add(channel_list to start_brightness)
+            event_changes.getOrPut(end_time) { mutableListOf() }.add(channel_list to -start_brightness)
+        }
     }
 
     private fun process_keyframes_glyph(
@@ -1034,6 +1290,7 @@ class MainService : Service() {
             for ((channels, brightness) in changes) {
                 for (channel in channels) {
                     channels_to_update.add(channel)
+
                     val brightness_list: MutableList<Int> = active_brightness.getOrPut(channel) { mutableListOf() }
 
                     if (brightness > 0) {
@@ -1066,11 +1323,8 @@ class MainService : Service() {
         }
     }
 
-    // Playback Section
-    private fun play_from_timeline(
-        start_ms:     Long,
-        ignore_speed: Boolean = false
-    ): Unit {
+    // Playback Engine Section
+    private fun play_from_timeline(start_ms: Long): Unit {
         if (!timeline_built) {
             return
         }
@@ -1080,33 +1334,29 @@ class MainService : Service() {
 
         val initial_state: MutableMap<Int, Int> = mutableMapOf<Int, Int>()
 
-        for ((time, event_array) in precomputed_events) {
-            if (time > start_ms) {
-                continue
-            }
-
+        for ((time, event_array) in precomputed_events.headMap(start_ms + 1L)) {
             for (index in event_array.indices step 2) {
                 initial_state[event_array[index]] = event_array[index + 1]
             }
         }
 
-        animation_job = service_scope.launch {
-            var last_real_time: Long                       = System.currentTimeMillis()
-            val sorted_timeline: SortedMap<Long, IntArray> = precomputed_events.toSortedMap()
+        val initial_frame: Map<Int, Int> = initial_state.filterValues { value: Int -> value > 0 }
+        update_glyph_frame(initial_frame)
 
-            val effective_speed: () -> Double = {
-                if (ignore_speed) 1.0 else playback_speed
-            }
+        animation_job = service_scope.launch(playback_dispatcher) {
+            elevate_process_priority()
+
+            var last_real_time: Long = System.currentTimeMillis()
 
             while (isActive && current_timeline_position <= maximum_timeline_ms) {
                 val current_time: Long = System.currentTimeMillis()
                 val delta_time: Long   = current_time - last_real_time
 
-                last_real_time         = current_time
-                current_timeline_position += delta_time * effective_speed()
+                last_real_time              = current_time
+                current_timeline_position += delta_time * playback_speed
 
-                val previous_position: Long = (current_timeline_position - (delta_time * effective_speed())).toLong()
-                val events_in_window: SortedMap<Long, IntArray> = sorted_timeline.subMap(
+                val previous_position: Long = (current_timeline_position - (delta_time * playback_speed)).toLong()
+                val events_in_window        = precomputed_events.subMap(
                     previous_position,
                     current_timeline_position.toLong() + 1L
                 )
@@ -1124,9 +1374,7 @@ class MainService : Service() {
                 if (frame_changed) {
                     val current_frame: Map<Int, Int> = initial_state.filterValues { value: Int -> value > 0 }
 
-                    withContext(Dispatchers.Main) {
-                        update_glyph_frame(current_frame)
-                    }
+                    update_glyph_frame(current_frame)
                 }
 
                 delay(animation_step_ms)
@@ -1142,46 +1390,21 @@ class MainService : Service() {
     private fun stop_all(): Unit {
         cancel_animation_job()
 
-        service_scope.launch(Dispatchers.Main) {
+        service_scope.launch(playback_dispatcher) {
             turn_off_all_channels()
         }
     }
 
-    fun play_json_glyph_map(
-        json_object:  JSONObject,
-        ignore_speed: Boolean = false
-    ): Unit {
-        service_scope.launch {
-            data_lock.withLock {
-                glyph_map.clear()
-                precomputed_events.clear()
-                timeline_built = false
-
-                val glyphs_array: JSONArray = extract_glyphs_array(json_object) ?: return@withLock
-
-                for (index in 0 until glyphs_array.length()) {
-                    val glyph: JSONObject  = glyphs_array.getJSONObject(index)
-                    val identifier: String = glyph.optString("id", UUID.randomUUID().toString())
-
-                    glyph.put("id", identifier)
-                    glyph_map[identifier] = glyph
-                }
-
-                build_timeline_internal()
-            }
-
-            play_from_timeline(0L, ignore_speed = ignore_speed)
-        }
-    }
-
-    // Frame Rendering Section
+    // Frame Hardware Section
     private fun resolve_track_channels(track_name: String): IntArray? {
         ensure_device_registered_immediately()
 
         val track_map: Map<String, IntArray> = current_track_map ?: return null
 
         if (track_name.equals("A", ignoreCase = true)) {
-            track_map["A"]?.let { channels: IntArray -> return channels }
+            track_map["A"]?.let { channels: IntArray ->
+                return channels
+            }
 
             return track_map.entries
                 .filter { entry: Map.Entry<String, IntArray> -> entry.key != "A" }
@@ -1199,7 +1422,10 @@ class MainService : Service() {
     ): IntArray? {
         if (glyph.has("channels")) {
             val channels_array: JSONArray? = glyph.optJSONArray("channels")
-            return IntArray(channels_array?.length() ?: 0) { index: Int -> channels_array?.getInt(index) ?: 0 }
+
+            return IntArray(channels_array?.length() ?: 0) { index: Int ->
+                channels_array?.getInt(index) ?: 0
+            }
         }
 
         val full_track_channels: IntArray = resolve_track_channels(track_name) ?: return null
@@ -1215,10 +1441,6 @@ class MainService : Service() {
         segments.forEach { segment_index: Int ->
             if (segment_index in full_track_channels.indices) {
                 result_channels.add(full_track_channels[segment_index])
-            }
-
-            else {
-                Log.w(log_tag, "Segment index $segment_index out of bounds for track '$track_name'")
             }
         }
 
@@ -1253,12 +1475,11 @@ class MainService : Service() {
 
             builder.buildPeriod(frame_period_ms)
 
-            val frame: GlyphFrame = builder.build()
-            glyph_manager?.toggle(frame)
+            glyph_manager?.toggle(builder.build())
         }
 
         catch (exception: Exception) {
-            Log.e(log_tag, "Fallback frame toggle failed for $device_identifier: ${exception.message}")
+            Log.e(log_tag, "Fallback toggle failed: ${exception.message}")
         }
     }
 
@@ -1274,7 +1495,6 @@ class MainService : Service() {
             }
 
             catch (exception: Exception) {
-                Log.e(log_tag, "Failed to call setFrameColors for $device_identifier: ${exception.message}")
                 toggle_glyph_frame_fallback(device_identifier, active_channels)
             }
 
@@ -1292,11 +1512,9 @@ class MainService : Service() {
 
             try {
                 glyph_manager?.setFrameColors(IntArray(segment_count) { 0 })
-                Log.i(log_tag, "All $device_identifier glyphs turned off via setFrameColors")
             }
 
             catch (exception: Exception) {
-                Log.w(log_tag, "setFrameColors turnOff failed, attempting fallback: ${exception.message}")
                 toggle_glyph_frame_fallback(device_identifier, emptyMap())
             }
 
@@ -1304,25 +1522,9 @@ class MainService : Service() {
         }
 
         toggle_glyph_frame_fallback(device_identifier, emptyMap())
-        Log.i(log_tag, "All glyphs turned off")
     }
 
-    // Mathematics Section
-    private fun apply_easing(
-        easing:   String,
-        progress: Double
-    ): Double = when (easing) {
-        "ease_in" -> progress * progress
-
-        "ease_out" -> 1.0 - (1.0 - progress).pow(2)
-
-        "ease_in_out" -> if (progress < 0.5) 2.0 * progress * progress else 1.0 - (-2.0 * progress + 2.0).pow(2) / 2.0
-
-        "ease_out_cubic" -> 1.0 - (1.0 - progress).pow(3)
-
-        else -> progress
-    }
-
+    // Interpolation Section
     private fun interpolate_keyframes(
         keyframes: List<Pair<Double, Double>>,
         easing:    String,
@@ -1345,8 +1547,17 @@ class MainService : Service() {
         val (previous_progress, previous_brightness) = keyframes[next_index - 1]
         val (next_progress, next_brightness)         = keyframes[next_index]
 
-        val segment_progress: Double                 = (progress - previous_progress) / (next_progress - previous_progress)
-        val eased_progress: Double                   = apply_easing(easing, segment_progress)
+        val segment_progress: Double = (progress - previous_progress) / (next_progress - previous_progress)
+
+        val eased_progress: Double = when (easing) {
+            "ease_in" -> segment_progress * segment_progress
+
+            "ease_out" -> 1.0 - (1.0 - segment_progress).pow(2)
+
+            "ease_in_out" -> if (segment_progress < 0.5) 2.0 * segment_progress.pow(2) else 1.0 - (-2.0 * segment_progress + 2.0).pow(2) / 2.0
+
+            else -> segment_progress
+        }
 
         return previous_brightness + (next_brightness - previous_brightness) * eased_progress
     }
@@ -1355,9 +1566,13 @@ class MainService : Service() {
         return ((brightness.coerceIn(0.0, 100.0) / 100.0) * maximum_brightness).roundToInt()
     }
 
-    // Resource Cleanup Section
+    // Cleanup Section
     private fun cleanup(): Unit {
         stop_all()
+
+        is_glyph_initialized = false
+        is_session_opened     = false
+        active_client_socket  = null
 
         connect_animation_job?.cancel()
         connect_animation_job = null
@@ -1374,14 +1589,46 @@ class MainService : Service() {
             Log.w(log_tag, "Error closing server socket: ${exception.message}")
         }
 
+        try {
+            udp_socket?.close()
+            udp_socket = null
+        }
+
+        catch (exception: Exception) {
+            Log.w(log_tag, "Error closing udp socket: ${exception.message}")
+        }
+
+        if (wake_lock?.isHeld == true) {
+            wake_lock?.release()
+        }
+
+        wake_lock = null
+
+        if (low_latency_wifi_lock?.isHeld == true) {
+            low_latency_wifi_lock?.release()
+        }
+
+        low_latency_wifi_lock = null
+
+        if (wifi_lock?.isHeld == true) {
+            wifi_lock?.release()
+        }
+
+        wifi_lock = null
+
+        if (multicast_lock?.isHeld == true) {
+            multicast_lock?.release()
+        }
+
+        multicast_lock = null
+
         service_scope.cancel()
+        playback_executor.shutdown()
 
         connection_sound?.release()
         connection_sound = null
 
         disconnection_sound?.release()
         disconnection_sound = null
-
-        Log.i(log_tag, "Resources cleaned up")
     }
 }
