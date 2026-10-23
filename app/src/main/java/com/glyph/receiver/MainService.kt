@@ -178,7 +178,7 @@ class MainService : Service() {
             "4" to intArrayOf(5),
             "5" to intArrayOf(2),
             "6" to intArrayOf(3),
-            "7" to (7 .. 14).toList().toIntArray(),
+            "7" to (14 downTo 7).toList().toIntArray(),
             "8" to intArrayOf(6)
         )
     )
@@ -194,7 +194,7 @@ class MainService : Service() {
             "7"  to intArrayOf(21),
             "8"  to intArrayOf(22),
             "9"  to intArrayOf(23),
-            "10" to (25 .. 32).toList().toIntArray(),
+            "10" to (32 downTo 25).toList().toIntArray(),
             "11" to intArrayOf(24)
         )
     )
@@ -211,7 +211,7 @@ class MainService : Service() {
         mapOf(
             "1" to (0 .. 19).toList().toIntArray(),
             "2" to (20 .. 30).toList().toIntArray(),
-            "3" to intArrayOf(35, 34, 33, 32, 31)
+            "3" to (31 .. 35).toList().toIntArray()
         )
     )
 
